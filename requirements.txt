@@ -3,3 +3,5 @@ uvicorn
 stripe
 python-dotenv
 sqlalchemy
+razorpay
+paypal-checkout-serversdk

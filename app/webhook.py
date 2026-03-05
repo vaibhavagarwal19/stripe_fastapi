@@ -1,6 +1,11 @@
+import hashlib
+import hmac
+
 import stripe
 from fastapi import APIRouter, Request, HTTPException
-from app.config import STRIPE_WEBHOOK_SECRET
+from pydantic import BaseModel
+
+from app.config import RAZORPAY_KEY_SECRET, STRIPE_WEBHOOK_SECRET
 from app.database import SessionLocal
 from app.models import Payment
 
@@ -23,9 +28,7 @@ async def stripe_webhook(request: Request):
     intent = event["data"]["object"]
     order_id = intent["metadata"].get("order_id")
 
-    payment = db.query(Payment).filter(
-        Payment.order_id == order_id
-    ).first()
+    payment = db.query(Payment).filter(Payment.order_id == order_id).first()
 
     if not payment:
         return {"status": "ignored"}
@@ -50,5 +53,76 @@ async def stripe_webhook(request: Request):
     elif event["type"] == "payment_intent.payment_failed":
         payment.status = "failed"
 
+    db.commit()
+    return {"status": "ok"}
+
+
+class RazorpayVerifyRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+
+@router.post("/razorpay/verify")
+def verify_razorpay(request: RazorpayVerifyRequest):
+    if not RAZORPAY_KEY_SECRET:
+        raise HTTPException(status_code=500, detail="Razorpay secret is not configured")
+
+    body = f"{request.razorpay_order_id}|{request.razorpay_payment_id}"
+    expected_signature = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(),
+        body.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+    db = SessionLocal()
+    payment = db.query(Payment).filter(Payment.provider_order_id == request.razorpay_order_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if hmac.compare_digest(expected_signature, request.razorpay_signature):
+        payment.status = "success"
+        payment.provider_payment_id = request.razorpay_payment_id
+        db.commit()
+        return {"status": "success"}
+
+    payment.status = "failed"
+    db.commit()
+    raise HTTPException(status_code=400, detail="Invalid signature")
+
+
+@router.post("/paypal")
+async def paypal_webhook(request: Request):
+    # For production, validate webhook signatures with PayPal transmission headers.
+    payload = await request.json()
+
+    event_type = payload.get("event_type")
+    resource = payload.get("resource", {})
+
+    order_id = resource.get("custom_id") or resource.get("invoice_id")
+    capture_id = resource.get("id")
+
+    db = SessionLocal()
+    payment = None
+
+    if order_id:
+        payment = db.query(Payment).filter(Payment.order_id == order_id).first()
+    if not payment and resource.get("supplementary_data", {}).get("related_ids", {}).get("order_id"):
+        provider_order_id = resource["supplementary_data"]["related_ids"]["order_id"]
+        payment = db.query(Payment).filter(Payment.provider_order_id == provider_order_id).first()
+
+    if not payment:
+        return {"status": "ignored"}
+
+    if event_type == "PAYMENT.CAPTURE.COMPLETED":
+        payment.status = "success"
+        payment.provider_payment_id = capture_id
+    elif event_type in {"PAYMENT.CAPTURE.DENIED", "PAYMENT.CAPTURE.DECLINED"}:
+        payment.status = "failed"
+    elif event_type == "PAYMENT.CAPTURE.REFUNDED":
+        payment.status = "refunded"
+        payment.provider_refund_id = resource.get("id")
+
+    payment.raw_response = str(payload)
     db.commit()
     return {"status": "ok"}
